@@ -1,6 +1,7 @@
-# 逐日温度网格 → 站点时序提取服务
+# 逐日温度网格 → 站点时序提取与热区事件检测服务
 
-把逐日温度的规则经纬网格（NetCDF）按调查站点提取为站点级时序 CSV，供暴露分析使用。
+把逐日温度的规则经纬网格（NetCDF）按调查站点提取为站点级时序 CSV，供暴露分析使用；
+并支持**热区事件检测**：识别跨日延续的高温区域，返回需复核的起止日期与逐日格点。
 
 技术栈：**FastAPI + xarray + netCDF4**，以 Docker Compose 一键启动，Swagger 文档在 `/docs`。
 
@@ -21,23 +22,36 @@
 | 下载 | 仅 **completed** 任务可下载完整 CSV，其余状态返回 409 |
 | 重启恢复 | 重启后未完成任务记为 `failed`；已完成结果仍可下载 |
 
+### 热区事件检测的额外约束
+
+| 维度 | 约定 |
+| --- | --- |
+| 时间轴 | 仅接受**每日零点**（00:00:00）记录，且**严格递增、不重复** |
+| 网格规模 | `time × lat × lon` ≤ **100 000** |
+| 阈值 | 必须为**有限数值**（拒绝 NaN/Inf），判定为 `value >= threshold` |
+| 最短持续天数 | 整数，**至少为 2** |
+| 经度整圈 | `nlon × dlon = 360°` 时首末列相邻；首尾落在同一物理经线（如 0..360、-180..180）**报错** |
+| 连通规则 | 每日达标格点按**四邻接**连通；相邻日期**仅通过同一格点**连接；**缺日/缺测不连通** |
+| 事件归并 | **分叉后再汇合的区域归为同一事件**（按图连通分量整体计算） |
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI 路由：上传/查询/取消/下载
+│   ├── main.py            # FastAPI 路由：上传/查询/取消/下载 + 热区事件检测
 │   ├── task_manager.py    # 并发槽位、状态机、取消/超时、持久化与重启恢复
 │   ├── extraction.py      # 球面最近格点、分块提取、原子发布 CSV
+│   ├── heat_events.py     # 热区事件检测：时间轴/经度校验、并查集连通、事件聚合
 │   ├── validation.py      # 网格/公历/站点输入校验
 │   ├── netcdf_guard.py    # HDF5/netCDF4 访问串行锁（线程安全）
 │   ├── config.py          # 环境变量配置
 │   └── states.py          # 任务状态常量
 ├── samples/
-│   ├── generate_samples.py  # 生成虚构网格、站点与慢提取样例
+│   ├── generate_samples.py  # 生成虚构网格、站点、慢提取与热区事件样例
 │   ├── demo_api.sh          # 端到端操作演示脚本
 │   └── data/                # 生成的样例文件（运行脚本后出现）
-├── tests/                 # pytest 测试（29 个，含并发/取消/超时/重启恢复）
+├── tests/                 # pytest 测试（56 个，含并发/取消/超时/重启恢复/热区事件）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -75,6 +89,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/tasks/{id}` | 查询单个任务状态与进度 |
 | POST | `/api/tasks/{id}/cancel` | 请求取消 |
 | GET | `/api/tasks/{id}/download` | 下载结果 CSV（仅 completed） |
+| POST | `/api/heat-events` | 上传 NetCDF + 阈值/最短持续天数，**同步**返回热区事件 |
 | GET | `/docs` | Swagger UI，可直接在页面操作全部接口 |
 
 ### 创建任务的表单字段
@@ -108,13 +123,72 @@ HOLE,2026-01-01,0.0,180.0,
 - `grid_lat/grid_lon` 为命中的**网格原始坐标**（保留 0–360 或降序纬度等原始写法）
 - `temperature` 缺测时为空
 
+## 热区事件检测（POST /api/heat-events）
+
+同步接口：上传 NetCDF 后立即完成检测并在响应中返回结果（不占用提取任务槽位），
+适合在 `/docs` 页面直接提交网格并查看结果。
+
+### 表单字段
+
+- `file`：NetCDF 文件（≤ 32 MiB，结构与日历校验同站点提取一致）
+- `variable`：温度变量名，如 `tas`
+- `threshold`：高温阈值（与变量同单位），必须为有限数值
+- `min_duration_days`：最短持续天数，至少为 2
+
+### 判定规则
+
+1. 每日 `value >= threshold` 的格点按**四邻接**（纬向/经向）聚类；
+   经度覆盖整圈（`nlon × dlon = 360°`）时首末两列也算相邻。
+2. 相邻日期之间**只通过同一高温格点**（同 lat/lon 且两日均达标）连接；
+   时间轴缺日（间隔 ≠ 1 天）或格点缺测（NaN）都不连通。
+3. 所有热格点构成一张图，**连通分量即事件**——因此分叉后再汇合的区域
+   仍归为同一事件，不会被拆成多个。
+4. 仅返回持续天数 ≥ `min_duration_days` 的事件；持续天数为事件覆盖的
+   日历日数（事件内部日期必然连续）。
+
+### 响应示例
+
+```json
+{
+  "variable": "tas",
+  "threshold": 30.0,
+  "min_duration_days": 2,
+  "grid": {"ntime": 24, "nlat": 7, "nlon": 18, "total_cells": 3024, "lon_full_circle": true},
+  "event_count": 1,
+  "events": [
+    {
+      "event_id": 1,
+      "start_date": "2026-07-04",
+      "end_date": "2026-07-10",
+      "duration_days": 7,
+      "total_cells": 21,
+      "days": [
+        {
+          "date": "2026-07-04",
+          "point_count": 3,
+          "points": [
+            {"lat": 0.0, "lon": 100.0},
+            {"lat": 0.0, "lon": 120.0},
+            {"lat": 20.0, "lon": 100.0}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `events` 按起始日排序，`event_id` 从 1 开始连续编号
+- `days[].points` 给出该日事件涉及的**格点经纬度**（文件原始坐标），按网格行主序排列
+- 无任何达标事件时 `event_count` 为 0、`events` 为空数组（HTTP 200）
+
 ## 命令行演示
 
 ```bash
 bash samples/demo_api.sh
 ```
 
-脚本依次演示：健康检查 → 上传建任务 → 轮询状态 → 下载 CSV → 慢任务取消（含取消后下载返回 409）。
+脚本依次演示：健康检查 → 上传建任务 → 轮询状态 → 下载 CSV → 慢任务取消（含取消后下载返回 409）→ 热区事件检测。
 
 ## 虚构样例说明
 
@@ -126,6 +200,7 @@ bash samples/demo_api.sh
 | `demo_grid_desc.nc` | **降序纬度** + -180–180 经度，变量 `temperature` |
 | `demo_slow_cancel.nc` | 可控慢提取：每 5 天休眠 2 秒（约 12 秒），用于演示**取消** |
 | `demo_slow_timeout.nc` | 可控慢提取：每 2 天休眠 5 秒（约 75 秒），用于演示 **60 秒超时** |
+| `demo_heatwaves.nc` | 热区事件演示（24 天 × 7 × 18，整圈经度）：持续 7 天事件、分叉再汇合、跨日期变更线、缺测打断；建议参数 `threshold=30, min_duration_days=2`，预期 4 个事件 |
 | `stations.csv` / `stations.json` | 10 个虚构站点，覆盖两种经度约定 |
 
 慢提取由 NetCDF 全局属性驱动（仅本服务识别，真实文件会被忽略）：
@@ -151,7 +226,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-测试覆盖：网格/公历/站点校验、球面最近格点（降序纬度、经度约定）、缺测留空、取消、超时、并发上限与槽位释放、下载门禁、重启恢复，共 29 项。
+测试覆盖：网格/公历/站点校验、球面最近格点（降序纬度、经度约定）、缺测留空、取消、超时、并发上限与槽位释放、下载门禁、重启恢复，以及热区事件（四邻接/整圈环绕/重复经线/缺日缺测/分叉汇合/参数与规模校验），共 56 项。
 
 ## 配置（环境变量）
 
@@ -163,3 +238,4 @@ pytest
 | `APP_MAX_PARALLEL_TASKS` | `2` | 并行任务上限 |
 | `APP_TASK_TIMEOUT_SECONDS` | `60` | 单任务计算时限 |
 | `APP_CHUNK_SIZE` | `10` | 每次读取的时间步分块大小 |
+| `APP_MAX_HEAT_CELLS` | `100000` | 热区事件检测的网格规模上限（time×lat×lon） |

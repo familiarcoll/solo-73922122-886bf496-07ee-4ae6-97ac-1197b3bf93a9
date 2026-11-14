@@ -43,3 +43,19 @@ sleep 3
 curl -sS "$BASE/api/tasks/$SLOW_ID" | python3 -m json.tool
 echo "取消后尝试下载（应返回 409）："
 curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$BASE/api/tasks/$SLOW_ID/download"
+
+echo "== 6. 热区事件检测（同步返回，演示网格含 4 个持续达标事件） =="
+curl -sS -X POST "$BASE/api/heat-events" \
+  -F "file=@$DATA/demo_heatwaves.nc" \
+  -F "variable=tas" \
+  -F "threshold=30" \
+  -F "min_duration_days=2" \
+  | python3 -c "
+import sys, json
+body = json.load(sys.stdin)
+print('事件数:', body['event_count'], ' 整圈经度:', body['grid']['lon_full_circle'])
+for ev in body['events']:
+    print(f\"  事件{ev['event_id']}: {ev['start_date']} ~ {ev['end_date']} 持续{ev['duration_days']}天 共{ev['total_cells']}格点\")
+    first = ev['days'][0]
+    print(f\"    首日 {first['date']} 涉及 {first['point_count']} 个格点，示例: {first['points'][:2]}\")
+"

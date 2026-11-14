@@ -6,6 +6,7 @@
   demo_grid_desc.nc     降序纬度 + -180~180 经度，变量 temperature
   demo_slow_cancel.nc   可控慢提取：每 5 天休眠 2s（共约 12s），用于演示取消
   demo_slow_timeout.nc  可控慢提取：每 2 天休眠 5s（共约 75s），用于演示 60s 超时
+  demo_heatwaves.nc     热区事件演示：持续事件、分叉汇合、跨变更线、缺测打断
   stations.csv          10 个虚构站点（同时覆盖两种经度约定）
   stations.json         同样站点的 JSON 形式
 
@@ -105,7 +106,53 @@ def main() -> None:
     }
     write_nc(ds4, os.path.join(OUT, "demo_slow_timeout.nc"))
 
-    # 5) 虚构站点（部分经度用 0~360，部分用 -180~180，含缺测空洞附近点）
+    # 5) 热区事件演示网格：24 天 × 7 纬 × 18 经（0~340°，整圈），背景 < 25°C
+    #    建议查询参数：variable=tas, threshold=30, min_duration_days=2
+    heat_times = pd.date_range("2026-07-01", periods=24, freq="D")
+    hlats = np.arange(-60.0, 61.0, 20.0)  # 7 条纬线
+    hlons = np.arange(0.0, 360.0, 20.0)   # 18 条经线，覆盖整圈（首尾相邻）
+    rng = np.random.default_rng(7)
+    base = 12.0 + 8.0 * np.cos(np.radians(hlats))[None, :, None]
+    noise = rng.normal(0, 1.0, size=(len(heat_times), len(hlats), len(hlons)))
+    hv = (base + noise).astype("float32")
+
+    def _put(day: int, la: int, lo: int, val: float = 36.0) -> None:
+        hv[day, la, lo] = val
+
+    # 事件 A：赤道附近持续 7 天的斑块（7 月 4~10 日）
+    for d in range(3, 10):
+        for la, lo in ((3, 5), (3, 6), (4, 5)):
+            _put(d, la, lo)
+    # 单日热斑（不满足最短持续天数，应被过滤掉）
+    _put(11, 1, 9)
+    # 事件 C：分叉后再汇合（7 月 13~15 日，40°N 一带）
+    for lo in (10, 11, 12):
+        _put(12, 5, lo)
+    _put(13, 5, 10)
+    _put(13, 5, 12)
+    for lo in (10, 11, 12):
+        _put(14, 5, lo)
+    # 事件 D：跨越日期变更线（7 月 17~20 日，首末经列相邻）
+    for d in range(16, 20):
+        _put(d, 2, 0)
+        _put(d, 2, 17)
+    # 事件 E：被缺测打断（7 月 21/22/24 日达标，23 日缺测 → 拆成两段）
+    for d in (20, 21, 23):
+        _put(d, 4, 14)
+        _put(d, 4, 15)
+    hv[22, 4, 14] = np.nan
+    hv[22, 4, 15] = np.nan
+
+    da5 = xr.DataArray(
+        hv,
+        dims=("time", "lat", "lon"),
+        coords={"time": heat_times, "lat": hlats, "lon": hlons},
+        name="tas",
+        attrs={"units": "degC", "long_name": "fictional daily temperature with heat events"},
+    )
+    write_nc(da5.to_dataset(), os.path.join(OUT, "demo_heatwaves.nc"))
+
+    # 6) 虚构站点（部分经度用 0~360，部分用 -180~180，含缺测空洞附近点）
     stations = [
         ("ST01", 39.90, 116.40),   # 北京
         ("ST02", 31.23, 121.47),   # 上海

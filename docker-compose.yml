@@ -1,7 +1,7 @@
 services:
   api:
     build: .
-    image: climate-station-extract:1.0.0
+    image: climate-station-extract:1.1.0
     container_name: climate-station-extract
     ports:
       - "8000:8000"
@@ -12,6 +12,7 @@ services:
       APP_MAX_PARALLEL_TASKS: "2"
       APP_TASK_TIMEOUT_SECONDS: "60"
       APP_CHUNK_SIZE: "10"
+      APP_MAX_HEAT_CELLS: "100000"          # 热区检测 time×lat×lon 上限
     volumes:
       - climate_data:/data
     restart: unless-stopped

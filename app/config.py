@@ -29,6 +29,8 @@ class Settings:
     task_timeout_seconds: float = _env_float("APP_TASK_TIMEOUT_SECONDS", 60.0)
     # 每个时间块的步数，演示用慢提取按块休眠
     chunk_size: int = _env_int("APP_CHUNK_SIZE", 10)
+    # 热区事件检测的网格规模上限（time×lat×lon）
+    max_heat_cells: int = _env_int("APP_MAX_HEAT_CELLS", 100_000)
 
     @property
     def upload_dir(self) -> str:
